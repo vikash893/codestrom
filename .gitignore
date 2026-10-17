@@ -1,0 +1,115 @@
+# ==========================================
+# MediResQ / Codestrom Master .gitignore
+# ==========================================
+
+# --- Node.js Dependencies ---
+node_modules/
+**/node_modules/
+package-lock.json.bak
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# --- Environment & Sensitive Files ---
+.env
+.env.*
+*.env
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
+# --- Python & Virtual Environments ---
+.venv/
+venv/
+ENV/
+env/
+**/.venv/
+**/venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+develop-eggs/
+eggs/
+.eggs/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# --- Testing & Coverage ---
+.pytest_cache/
+**/.pytest_cache/
+.coverage
+.coverage.*
+coverage/
+**/coverage/
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# --- Build Outputs & Bundles ---
+dist/
+**/dist/
+build/
+**/build/
+dist-ssr/
+out/
+.next/
+.nuxt/
+.cache/
+**/.cache/
+.parcel-cache/
+
+# --- Logs & Runtime Data ---
+logs/
+**/logs/
+*.log
+*.pid
+*.seed
+*.pid.lock
+
+# --- Local Databases & Dumps ---
+*.sqlite
+*.sqlite3
+*.db
+*.rdb
+*.dump
+mongo-dump/
+
+# --- Secret Keys & Certificates ---
+*.pem
+*.key
+*.cert
+*.crt
+*.pfx
+*.p12
+*.cer
+id_rsa
+id_rsa.pub
+
+# --- IDEs & System Files ---
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Temporary & Upload Files ---
+tmp/
+temp/
+**/tmp/
+**/temp/
+uploads/
+**/uploads/

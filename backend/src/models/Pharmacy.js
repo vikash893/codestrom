@@ -58,6 +58,15 @@ const pharmacySchema = new mongoose.Schema(
       type: Number,
       default: 10,
     },
+    homeDeliveryAvailable: {
+      type: Boolean,
+      default: true,
+      index: true,
+    },
+    deliveryRadiusKm: {
+      type: Number,
+      default: 10,
+    },
     isVerified: {
       type: Boolean,
       default: false,

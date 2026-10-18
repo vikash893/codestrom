@@ -57,3 +57,25 @@ export const authorize = (...allowedRoles) => {
     next();
   };
 };
+
+export const optionalAuthenticate = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return next();
+    }
+    const token = authHeader.split(' ')[1];
+    if (!token) return next();
+
+    const decoded = jwt.verify(token, config.jwtSecret);
+    const user = await User.findById(decoded.id).select('-passwordHash');
+    if (user && user.status !== 'suspended') {
+      req.user = user;
+    }
+    next();
+  } catch (error) {
+    // Non-blocking for optional authentication
+    next();
+  }
+};
+

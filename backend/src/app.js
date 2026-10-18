@@ -17,6 +17,7 @@ import notificationRoutes from './routes/notificationRoutes.js';
 import uploadRoutes from './routes/uploadRoutes.js';
 import adminRoutes from './routes/adminRoutes.js';
 import caseRoutes from './routes/caseRoutes.js';
+import orderRoutes from './routes/orderRoutes.js';
 import { errorHandler } from './middlewares/errorHandler.js';
 
 export const createApp = () => {
@@ -35,13 +36,27 @@ export const createApp = () => {
     app.use(morgan('dev'));
   }
 
-  // Rate Limiting (Emergency bypass: never block emergency triage or escalation calls!)
+  // Rate Limiting (Emergency bypass: never block emergency triage, dev, or localhost calls)
   const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 200, // limit each IP to 200 requests per windowMs
+    max: process.env.NODE_ENV === 'production' ? 3000 : 100000,
     standardHeaders: true,
     legacyHeaders: false,
     skip: (req) => {
+      // In local development or testing, never throttle requests
+      if (process.env.NODE_ENV !== 'production') return true;
+
+      // Skip localhost / loopback interfaces
+      const clientIp = req.ip || req.connection?.remoteAddress || '';
+      if (
+        clientIp === '127.0.0.1' ||
+        clientIp === '::1' ||
+        clientIp === '::ffff:127.0.0.1' ||
+        clientIp.includes('localhost')
+      ) {
+        return true;
+      }
+
       // Never block emergency triage or escalate endpoints
       return (
         req.path.includes('/api/v1/cases') &&
@@ -85,6 +100,7 @@ export const createApp = () => {
   app.use('/api/v1/notifications', notificationRoutes);
   app.use('/api/v1/uploads', uploadRoutes);
   app.use('/api/v1/admin', adminRoutes);
+  app.use('/api/v1/orders', orderRoutes);
 
 
   // 404 handler

@@ -9,63 +9,80 @@ import { Pharmacy } from '../models/Pharmacy.js';
 import { PharmacyInventory } from '../models/PharmacyInventory.js';
 import { DoctorProfile } from '../models/DoctorProfile.js';
 import { emitToRole, emitToUser } from '../config/socket.js';
+import {
+  detectLanguage,
+  extractSymptoms,
+  screenEmergency,
+  synthesizeClinicalEvidence,
+  computeAgeAdaptedDosage,
+  calculateDistanceKm,
+} from '../services/nlpEvidenceService.js';
 
-
-// Helper to determine WHO 4-tier triage priority locally if AI service is unavailable
-const evaluateLocalTriage = (description = '', severity = 'unknown') => {
-  const lower = description.toLowerCase();
-  const isEmergency =
-    lower.includes('chest pain') ||
-    lower.includes('heart attack') ||
-    lower.includes('cannot breathe') ||
-    lower.includes('sine me dard') ||
-    lower.includes('saans nahi') ||
-    lower.includes('stroke') ||
-    lower.includes('unconscious') ||
-    lower.includes('behosh');
-
-  if (isEmergency) {
-    return {
-      level: 'RED',
-      priority: 'P0_EMERGENCY',
-      reason_codes: ['CRITICAL_SYMPTOM_FALLBACK'],
-      patient_guidance:
-        'CRITICAL WARNING: Urgent symptoms detected. Please call 112 immediately or proceed to the nearest emergency hospital.',
-      requires_human_review: true,
-      ruleset_version: 'WHO-IITT-v1.2-fallback',
-    };
+// Cleanly maps and sanitizes clinical evidence synthesis to camelCase Mongoose schema
+const formatEvidenceSynthesis = (raw, description, severity, symptoms, ageYears = 25) => {
+  if (!raw || (!raw.possibleConditions && !raw.possible_conditions)) {
+    return synthesizeClinicalEvidence(symptoms, description, severity, ageYears);
   }
 
-  if (severity === 'severe' || lower.includes('high fever') || lower.includes('tez bukhar')) {
-    return {
-      level: 'YELLOW',
-      priority: 'P1_URGENT',
-      reason_codes: ['URGENT_SYMPTOM_OR_REPORTED_SEVERE'],
-      patient_guidance:
-        'URGENT REVIEW RECOMMENDED: High severity reported. A medical professional should evaluate you promptly.',
-      requires_human_review: true,
-      ruleset_version: 'WHO-IITT-v1.2-fallback',
-    };
-  }
+  const rawConditions = raw.possibleConditions || raw.possible_conditions || [];
+  const rawFirstAid = raw.firstAidMeasures || raw.first_aid_measures || [];
+  const rawMedicines = raw.suggestedMedicines || raw.suggested_otc_medicines || [];
 
-  if (description.trim().length < 10) {
+  const possibleConditions = rawConditions.map((c) => ({
+    name: c.name,
+    confidence: Number(c.confidence) || 0.7,
+    clinicalRationale: c.clinicalRationale || c.clinical_rationale || '',
+    missingFindings: c.missingFindings || c.missing_findings || [],
+    warningSigns: c.warningSigns || c.warning_signs || [],
+    citations: (c.citations || []).map((cit) => ({
+      source: cit.source || 'Medical Guidelines',
+      title: cit.title || '',
+      url: cit.url || '#',
+    })),
+  }));
+
+  const firstAidMeasures = rawFirstAid.map((fa) => ({
+    action: fa.action,
+    instructions: fa.instructions,
+    rationale: fa.rationale || '',
+  }));
+
+  const suggestedMedicines = rawMedicines.map((m) => {
+    const ageDose = computeAgeAdaptedDosage(m.name, m.genericName || m.generic_name, ageYears);
     return {
-      level: 'UNKNOWN',
-      priority: 'P2_PRIORITY',
-      reason_codes: ['INSUFFICIENT_INFORMATION'],
-      patient_guidance: 'Description is brief. Clinician review required.',
-      requires_human_review: true,
-      ruleset_version: 'WHO-IITT-v1.2-fallback',
+      name: m.name,
+      genericName: m.genericName || m.generic_name || '',
+      purpose: m.purpose || '',
+      ageGroup: ageDose.ageGroup,
+      doseAmount: ageDose.doseAmount,
+      frequency: ageDose.frequency,
+      dosageGuide: `${ageDose.doseAmount} - ${ageDose.frequency}. ${ageDose.instructions}`,
+      prescriptionRequired: m.prescriptionRequired ?? m.prescription_required ?? false,
+      precautions: m.precautions || ageDose.precautions,
     };
-  }
+  });
 
   return {
-    level: 'GREEN',
-    priority: 'P3_ROUTINE',
-    reason_codes: ['NON_URGENT_SYMPTOMS'],
-    patient_guidance: null,
-    requires_human_review: true,
-    ruleset_version: 'WHO-IITT-v1.2-fallback',
+    possibleConditions:
+      possibleConditions.length > 0
+        ? possibleConditions
+        : synthesizeClinicalEvidence(symptoms, description, severity, ageYears).possibleConditions,
+    firstAidMeasures:
+      firstAidMeasures.length > 0
+        ? firstAidMeasures
+        : synthesizeClinicalEvidence(symptoms, description, severity, ageYears).firstAidMeasures,
+    suggestedMedicines:
+      suggestedMedicines.length > 0
+        ? suggestedMedicines
+        : synthesizeClinicalEvidence(symptoms, description, severity, ageYears).suggestedMedicines,
+    clinicalRationale: raw.clinicalRationale || raw.clinical_rationale || '',
+    suggestedSpecialties: raw.suggestedSpecialties || raw.suggested_specialties || ['General Medicine'],
+    missingFindings: raw.missingFindings || raw.missing_findings || [],
+    redFlagWarning: raw.redFlagWarning || raw.red_flag_warning || null,
+    uncertaintyLevel: raw.uncertaintyLevel || raw.uncertainty_level || 'MODERATE',
+    disclaimer:
+      raw.disclaimer ||
+      'Medical decision-support only. Autonomous diagnosis or prescribing is strictly prohibited.',
   };
 };
 
@@ -106,14 +123,19 @@ export const createCase = async (req, res, next) => {
       }
     }
 
-    // Call Python AI Service for deterministic WHO 4-tier screening and feature extraction
+    // 1. NLP Pipeline: Language Detection, Symptom Extraction & Emergency Screening
     let aiData;
+    let extractedSymptoms = [];
+    let triage;
+    let cleanEvidence;
+    let detectedLang = detectLanguage(description, language);
+
     try {
       const aiResponse = await axios.post(
         `${config.aiServiceUrl}/api/v1/intake`,
         {
           description,
-          language,
+          language: detectedLang,
           duration,
           severity,
           age_years,
@@ -122,25 +144,41 @@ export const createCase = async (req, res, next) => {
         { timeout: 8000 }
       );
       aiData = aiResponse.data;
+      detectedLang = aiData.detected_language || detectedLang;
+      extractedSymptoms = (aiData.extracted_symptoms && aiData.extracted_symptoms.length > 0)
+        ? aiData.extracted_symptoms
+        : extractSymptoms(description);
+
+      triage = aiData.triage || screenEmergency(description, severity);
+      cleanEvidence = formatEvidenceSynthesis(
+        aiData.evidence_synthesis,
+        description,
+        severity,
+        extractedSymptoms,
+        age_years
+      );
     } catch (err) {
-      console.warn(`[Case Controller] AI service unavailable (${err.message}). Using local safe triage engine.`);
-      const localTriage = evaluateLocalTriage(description, severity);
+      console.warn(`[Case Controller] AI service unavailable (${err.message}). Using built-in local NLP & clinical engine.`);
+      extractedSymptoms = extractSymptoms(description);
+      triage = screenEmergency(description, severity);
+      cleanEvidence = synthesizeClinicalEvidence(extractedSymptoms, description, severity, age_years);
+
       aiData = {
         status: 'received',
         summary: `Patient description: ${description}`,
-        triage: localTriage,
-        patient_guidance: localTriage.patient_guidance,
-        detected_language: language,
-        extracted_symptoms: [],
+        triage,
+        patient_guidance: triage.guidance,
+        detected_language: detectedLang,
+        extracted_symptoms: extractedSymptoms,
+        evidence_synthesis: cleanEvidence,
         disclaimer:
           'This service does not provide an autonomous diagnosis or prescription. Seek emergency medical care immediately for severe symptoms.',
       };
     }
 
-    const triage = aiData.triage || evaluateLocalTriage(description, severity);
     const generatedCaseId = `CASE-${Date.now()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
 
-    // Create linked IntakeRecord
+    // 2. Persist Intake Record
     const intakeRecord = await IntakeRecord.create({
       patientId: req.user._id,
       rawDescription: description,
@@ -148,53 +186,49 @@ export const createCase = async (req, res, next) => {
       reportedSeverity: severity,
       patientAge: age_years,
       relevantHistory: relevant_history,
-      detectedLanguage: aiData.detected_language || language,
-      extractedSymptoms: aiData.extracted_symptoms || [],
-      isEmergency: triage.level === 'RED',
-      emergencyFlags: triage.reason_codes || [],
-      emergencyGuidance: triage.patient_guidance || null,
+      detectedLanguage: detectedLang,
+      extractedSymptoms,
+      isEmergency: triage.triageLevel === 'RED' || triage.level === 'RED' || triage.isEmergency,
+      emergencyFlags: triage.reasonCodes || triage.reason_codes || [],
+      emergencyGuidance: triage.guidance || triage.patient_guidance || null,
       structuredSummary: aiData.summary || description,
-      needsClinicianReview: triage.requires_human_review ?? true,
-      status: triage.level === 'RED' ? 'emergency_escalated' : 'received',
+      needsClinicianReview: triage.requiresHumanReview ?? triage.requires_human_review ?? true,
+      status: (triage.triageLevel === 'RED' || triage.level === 'RED') ? 'emergency_escalated' : 'received',
     });
 
     const parsedLat = Number(latitude) || 28.6139;
     const parsedLng = Number(longitude) || 77.209;
 
-    // Create durable Case
+    // 3. Persist Durable Prioritized Case with Evidence
     const newCase = await Case.create({
       caseId: generatedCaseId,
       patientId: req.user._id,
       intakeRecordId: intakeRecord._id,
       idempotencyKey: idempotencyKey || undefined,
-      triageLevel: triage.level,
-      priority: triage.priority,
-      reasonCodes: triage.reason_codes,
-      rulesetVersion: triage.ruleset_version || 'WHO-IITT-v1.2',
-      patientGuidance: triage.patient_guidance,
-      requiresHumanReview: triage.requires_human_review ?? true,
+      triageLevel: triage.triageLevel || triage.level || 'GREEN',
+      priority: triage.priority || 'P3_ROUTINE',
+      reasonCodes: triage.reasonCodes || triage.reason_codes || [],
+      rulesetVersion: triage.rulesetVersion || triage.ruleset_version || 'WHO-IITT-v1.2',
+      patientGuidance: triage.guidance || triage.patient_guidance,
+      requiresHumanReview: triage.requiresHumanReview ?? triage.requires_human_review ?? true,
       status: 'QUEUED',
       patientDetails: {
         description,
-        language: aiData.detected_language || language,
+        language: detectedLang,
         duration,
         severity,
         ageYears: age_years,
         relevantHistory: relevant_history,
-        extractedSymptoms: aiData.extracted_symptoms || [],
+        extractedSymptoms,
       },
-      evidenceSynthesis: aiData.evidence_synthesis || {
-        possibleConditions: [],
-        disclaimer: 'Medical decision-support only.',
-      },
+      evidenceSynthesis: cleanEvidence,
       patientLocation: {
         type: 'Point',
         coordinates: [parsedLng, parsedLat],
       },
     });
 
-    // Real-Time Notification & Broadcast
-    // 1. If P0 Emergency, broadcast immediate high-priority alert to all connected doctors & hospitals
+    // 4. Real-Time Broadcast & Alerting
     if (newCase.priority === 'P0_EMERGENCY' || newCase.triageLevel === 'RED') {
       emitToRole('doctor', 'emergency_alert', {
         caseId: newCase.caseId,
@@ -213,7 +247,6 @@ export const createCase = async (req, res, next) => {
       });
     }
 
-    // 2. Broadcast queue update to doctor and hospital channels
     emitToRole('doctor', 'queue_updated', {
       caseId: newCase.caseId,
       priority: newCase.priority,
@@ -227,19 +260,19 @@ export const createCase = async (req, res, next) => {
       status: newCase.status,
     });
 
-    // 3. Notify patient
+    // Notify patient
     await Notification.create({
       userId: req.user._id,
-      title: triage.level === 'RED' ? 'EMERGENCY WARNING' : 'Intake Case Queued',
+      title: newCase.triageLevel === 'RED' ? 'EMERGENCY WARNING' : 'Intake Case Queued',
       message:
-        triage.level === 'RED'
+        newCase.triageLevel === 'RED'
           ? `Immediate attention required: Call 112 or visit nearest emergency room. Case ${newCase.caseId} opened.`
-          : `Your symptoms have been logged as ${triage.priority} priority. Case ID: ${newCase.caseId}.`,
-      type: triage.level === 'RED' ? 'emergency' : 'system',
-      data: { caseId: newCase.caseId, triageLevel: triage.level },
+          : `Your symptoms have been logged as ${newCase.priority} priority. Case ID: ${newCase.caseId}.`,
+      type: newCase.triageLevel === 'RED' ? 'emergency' : 'system',
+      data: { caseId: newCase.caseId, triageLevel: newCase.triageLevel },
     });
 
-    // 4. Geospatial resource discovery matching patient's condition & location
+    // 5. Geospatial Resource Discovery: Hospitals, Available Doctors & Verified Pharmacies
     let nearbyFacilities = {
       hospitals: [],
       doctors: [],
@@ -247,92 +280,141 @@ export const createCase = async (req, res, next) => {
     };
 
     try {
-      const centerPoint = {
-        type: 'Point',
-        coordinates: [parsedLng, parsedLat],
-      };
-      const geoNearStage = {
-        $geoNear: {
-          near: centerPoint,
-          distanceField: 'distanceMeters',
-          maxDistance: 25000, // 25 km radius
-          spherical: true,
-        },
-      };
-
       // A. Emergency & General Hospitals
-      nearbyFacilities.hospitals = await Hospital.aggregate([
-        geoNearStage,
-        { $match: { isActive: true } },
-        {
-          $project: {
-            hospitalName: 1,
-            emergencyDepartmentAvailable: 1,
-            verifiedEmergencyNumbers: 1,
-            regularPhoneNumbers: 1,
-            address: 1,
-            traumaCareLevel: 1,
-            distanceMeters: { $round: ['$distanceMeters', 0] },
-          },
-        },
-        { $sort: { distanceMeters: 1 } },
-        { $limit: 3 },
-      ]);
+      const allHospitals = await Hospital.find({ isActive: true }).lean();
+      const scoredHospitals = allHospitals.map((hosp) => {
+        const distKm = hosp.location?.coordinates
+          ? calculateDistanceKm(parsedLng, parsedLat, hosp.location.coordinates[0], hosp.location.coordinates[1])
+          : null;
 
-      // B. Relevant Available Doctors
-      const suggestedSpecs = aiData.evidence_synthesis?.suggested_specialties || [];
-      const docMatch = { isAvailable: true };
-      if (suggestedSpecs.length > 0) {
-        docMatch.specialties = { $in: suggestedSpecs };
+        return {
+          _id: hosp._id,
+          hospitalName: hosp.hospitalName,
+          emergencyDepartmentAvailable: hosp.emergencyDepartmentAvailable,
+          verifiedEmergencyNumbers: hosp.verifiedEmergencyNumbers || [],
+          regularPhoneNumbers: hosp.regularPhoneNumbers || [],
+          address: hosp.address,
+          traumaCareLevel: hosp.traumaCareLevel,
+          distanceKm: distKm,
+          distanceMeters: distKm !== null ? Math.round(distKm * 1000) : null,
+        };
+      });
+
+      scoredHospitals.sort((a, b) => {
+        if (a.emergencyDepartmentAvailable && !b.emergencyDepartmentAvailable) return -1;
+        if (!a.emergencyDepartmentAvailable && b.emergencyDepartmentAvailable) return 1;
+        return (a.distanceKm ?? 9999) - (b.distanceKm ?? 9999);
+      });
+
+      nearbyFacilities.hospitals = scoredHospitals.slice(0, 3);
+
+      // B. Relevant Available Doctors & Clinicians
+      const suggestedSpecs = cleanEvidence.suggestedSpecialties || [];
+      const allDoctors = await DoctorProfile.find({ isAvailable: true, isVerified: true }).lean();
+
+      const scoredDoctors = allDoctors.map((doc) => {
+        const distKm = doc.location?.coordinates
+          ? calculateDistanceKm(parsedLng, parsedLat, doc.location.coordinates[0], doc.location.coordinates[1])
+          : null;
+
+        const matchesSpecialty = doc.specialties?.some((sp) => suggestedSpecs.includes(sp));
+
+        return {
+          _id: doc._id,
+          fullName: doc.fullName,
+          specialties: doc.specialties,
+          qualifications: doc.qualifications,
+          experienceYears: doc.experienceYears,
+          consultationFee: doc.consultationFee,
+          verifiedPhone: doc.verifiedPhone,
+          clinicAddress: doc.clinicAddress,
+          isAvailable: doc.isAvailable,
+          matchesSpecialty,
+          distanceKm: distKm,
+          distanceMeters: distKm !== null ? Math.round(distKm * 1000) : null,
+        };
+      });
+
+      // Sort: local doctors (< 50 km) first, matching specialty first, then nearest distance
+      scoredDoctors.sort((a, b) => {
+        const aIsLocal = (a.distanceKm ?? 9999) < 50;
+        const bIsLocal = (b.distanceKm ?? 9999) < 50;
+        if (aIsLocal && !bIsLocal) return -1;
+        if (!aIsLocal && bIsLocal) return 1;
+
+        if (a.matchesSpecialty && !b.matchesSpecialty) return -1;
+        if (!a.matchesSpecialty && b.matchesSpecialty) return 1;
+        return (a.distanceKm ?? 9999) - (b.distanceKm ?? 9999);
+      });
+
+      nearbyFacilities.doctors = scoredDoctors.slice(0, 3);
+
+      // C. Match Physical Pharmacies with Confirmed Stock of Suggested Medicines
+      const suggestedMeds = cleanEvidence.suggestedMedicines || [];
+      const searchKeywords = new Set();
+      for (const m of suggestedMeds) {
+        if (m.name) {
+          m.name.split(/[\s,/()]+/).filter((w) => w.length > 2).forEach((w) => searchKeywords.add(w.toLowerCase()));
+        }
+        if (m.genericName) {
+          m.genericName.split(/[\s,/()]+/).filter((w) => w.length > 2).forEach((w) => searchKeywords.add(w.toLowerCase()));
+        }
       }
 
-      nearbyFacilities.doctors = await DoctorProfile.aggregate([
-        geoNearStage,
-        { $match: docMatch },
-        {
-          $project: {
-            fullName: 1,
-            specialties: 1,
-            qualifications: 1,
-            consultationFee: 1,
-            verifiedPhone: 1,
-            isAvailable: 1,
-            distanceMeters: { $round: ['$distanceMeters', 0] },
-          },
-        },
-        { $sort: { distanceMeters: 1 } },
-        { $limit: 3 },
-      ]);
+      const allStockItems = await PharmacyInventory.find({
+        isAvailable: true,
+        availableQuantity: { $gt: 0 },
+      }).populate('pharmacyId').lean();
 
-      // C. Match physical pharmacies with stock for suggested medicines
-      const suggestedMeds = aiData.evidence_synthesis?.suggested_otc_medicines || [];
-      const searchTerms = suggestedMeds.map((m) => m.name.split('/')[0].trim());
+      const activePharmaciesStock = allStockItems.filter(
+        (item) => item.pharmacyId && item.pharmacyId.isActive
+      );
 
-      if (searchTerms.length > 0) {
-        const regexPatterns = searchTerms.map((term) => new RegExp(term, 'i'));
-        const stockItems = await PharmacyInventory.find({
-          isAvailable: true,
-          availableQuantity: { $gt: 0 },
-          $or: [
-            { medicineName: { $in: regexPatterns } },
-            { genericName: { $in: regexPatterns } },
-            { brandName: { $in: regexPatterns } },
-          ],
-        }).populate('pharmacyId').limit(5).lean();
+      const matchedPharmacies = [];
+      const seenPharmacies = new Set();
 
-        nearbyFacilities.pharmaciesWithStock = stockItems
-          .filter((item) => item.pharmacyId && item.pharmacyId.isActive)
-          .map((item) => ({
-            inventoryId: item._id,
-            medicineName: item.medicineName,
-            availableQuantity: item.availableQuantity,
-            unitPrice: item.unitPrice,
-            stockStatus: item.stockStatus,
-            pharmacyName: item.pharmacyId.storeName,
-            contactNumber: item.pharmacyId.verifiedContactNumber,
-            address: item.pharmacyId.address,
-          }));
+      for (const item of activePharmaciesStock) {
+        const ph = item.pharmacyId;
+        const distKm = ph.location?.coordinates
+          ? calculateDistanceKm(parsedLng, parsedLat, ph.location.coordinates[0], ph.location.coordinates[1])
+          : null;
+
+        const combinedText = `${item.medicineName} ${item.genericName || ''} ${item.brandName || ''}`.toLowerCase();
+        let isSameMedicineMatch = false;
+
+        for (const kw of searchKeywords) {
+          if (combinedText.includes(kw)) {
+            isSameMedicineMatch = true;
+            break;
+          }
+        }
+
+        matchedPharmacies.push({
+          inventoryId: item._id,
+          medicineName: item.medicineName,
+          genericName: item.genericName || item.brandName,
+          availableQuantity: item.availableQuantity,
+          unitPrice: item.unitPrice,
+          stockStatus: item.stockStatus,
+          pharmacyId: ph._id,
+          pharmacyName: ph.storeName,
+          contactNumber: ph.verifiedContactNumber,
+          callUrl: `tel:${ph.verifiedContactNumber}`,
+          address: ph.address,
+          distanceKm: distKm,
+          distanceMeters: distKm !== null ? Math.round(distKm * 1000) : null,
+          isSameMedicineMatch,
+        });
       }
+
+      // Sort: exact suggested medicine matches first, then nearest distance
+      matchedPharmacies.sort((a, b) => {
+        if (a.isSameMedicineMatch && !b.isSameMedicineMatch) return -1;
+        if (!a.isSameMedicineMatch && b.isSameMedicineMatch) return 1;
+        return (a.distanceKm ?? 9999) - (b.distanceKm ?? 9999);
+      });
+
+      nearbyFacilities.pharmaciesWithStock = matchedPharmacies.slice(0, 5);
     } catch (geoErr) {
       console.warn(`[Case Controller] Geospatial discovery error: ${geoErr.message}`);
     }
@@ -341,8 +423,8 @@ export const createCase = async (req, res, next) => {
       success: true,
       case: newCase,
       nearbyFacilities,
-      emergencyCallNumber: triage.level === 'RED' ? config.emergencyDispatchNumber : null,
-      disclaimer: aiData.disclaimer,
+      emergencyCallNumber: newCase.triageLevel === 'RED' ? config.emergencyDispatchNumber : null,
+      disclaimer: cleanEvidence.disclaimer,
     });
   } catch (error) {
     next(error);

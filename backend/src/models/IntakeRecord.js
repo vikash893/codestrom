@@ -5,8 +5,12 @@ const intakeRecordSchema = new mongoose.Schema(
     patientId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
-      required: true,
+      required: false,
       index: true,
+    },
+    gender: {
+      type: String,
+      default: 'unspecified',
     },
     rawDescription: {
       type: String,

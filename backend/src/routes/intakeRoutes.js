@@ -1,11 +1,11 @@
 import { Router } from 'express';
 import { submitIntake, getIntakeById } from '../controllers/intakeController.js';
-import { authenticate, authorize } from '../middlewares/auth.js';
+import { authenticate, optionalAuthenticate } from '../middlewares/auth.js';
 
 const router = Router();
 
-// Patients can submit intake; doctors, patients, and admins can read authorized intakes
-router.post('/', authenticate, authorize('patient'), submitIntake);
+// Allow both unauthenticated guests and authenticated patients to submit intake
+router.post('/', optionalAuthenticate, submitIntake);
 router.get('/:id', authenticate, getIntakeById);
 
 export default router;
